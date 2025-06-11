@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+/**
+ * @title Auction
+ * @dev Implements a auction with bid and refunds.
+ */
 contract Auction {
-    address public owner; // Address of the contract owner
+    address public owner; // Address of the owner
     address public highestBidder; // Address of highest bidder
     uint256 public highestBid; // Value of the highest bid
     uint256 public auctionEndTime; // Timestamp to end time
 
-    constructor(uint256 _durationMinutes) {
-        owner = msg.sender; // Set the contract creator as the owner
-        auctionEndTime = block.timestamp + _durationMinutes; // Set auction duration from now
-    }
-
-    bool public ended; // Flag to indicate if auction has ended
+    bool public ended; // Indicate if auction has ended
 
     struct Bid {
         uint256 amount; // Bid amount
@@ -21,77 +20,113 @@ contract Auction {
 
     mapping(address => Bid[]) public bids; // Stores all bids made by each address
     mapping(address => uint256) public pendingReturns; // Tracks funds to be returned
+    address[] public bidders; // Track bidders
+    mapping(address => bool) internal hasBid; // Track if bidder is already recorded
 
-    event NewBid(address indexed bidder, uint256 amount); // Emitted when a new valid bid is placed
-    event AuctionEnded(address winner, uint256 amount); // Emitted when the auction ends
+    event NewBid(address indexed bidder, uint256 amount);
+    event AuctionEnded(address winner, uint256 amount);
+    event Withdrawn(address indexed bidder, uint256 amount);
+    event EmergencyWithdrawal(address indexed owner, uint256 amount);
 
-    modifier onlyOwner() {
-        require(msg.sender == owner); // Restrict access to contract owner
-        _;
+    /**
+     * @dev Sets the auction duration from now.
+     * @param _durationMinutes Duration of the auction in minutes.
+     */
+    constructor(uint256 _durationMinutes) {
+        require(_durationMinutes > 0);
+        owner = msg.sender;
+        auctionEndTime = block.timestamp + _durationMinutes;
     }
 
-    modifier auctionActive() {
-        require(block.timestamp < auctionEndTime); // Only allow if auction is still ongoing
-        _;
-    }
+    /**
+     * @dev Allows bidders to place a bid.
+     */
+    function bid() external payable {
+        require(block.timestamp < auctionEndTime);
+        require(msg.value > highestBid);
 
-    modifier auctionEnded() {
-        require(block.timestamp >= auctionEndTime); // Only allow if auction time has passed
-        _;
-    }
-
-    function bid() external payable auctionActive {
-        // Function to place a bid during an active auction
-        require(msg.value > 0); // Must send a positive amount
-        uint256 minBid = (highestBid * 105) / 100; // Calculate 105% of the current highest bid
-        require(msg.value > minBid); // Require bid to be higher than 105% of current highest
-
-        if (msg.sender != highestBidder) {
-            pendingReturns[msg.sender] += msg.value; // Add to pending returns if not the highest bidder
+        if (!hasBid[msg.sender]) {
+            bidders.push(msg.sender);
+            hasBid[msg.sender] = true;
         }
 
-        bids[msg.sender].push(Bid(msg.value, block.timestamp)); // Save the bid with timestamp
-
-        highestBidder = msg.sender; // Update the current highest bidder
-        highestBid = msg.value; // Update the current highest bid
-
-        if (auctionEndTime - block.timestamp <= 10 minutes) {
-            auctionEndTime += 10 minutes; // Extend auction time if close to ending
+        if (highestBid != 0) {
+            pendingReturns[highestBidder] += highestBid;
         }
 
-        emit NewBid(msg.sender, msg.value); // Emit event for new bid
+        highestBidder = msg.sender;
+        highestBid = msg.value;
+        bids[msg.sender].push(Bid({ amount: msg.value, timestamp: block.timestamp }));
+
+        emit NewBid(msg.sender, msg.value);
     }
 
-    function endAuction() external auctionEnded {
-        // Function to officially end the auction
-        require(!ended); // Ensure auction hasn't already ended
+    /**
+     * @dev Ends the auction and announces the winner.
+     */
+    function endAuction() external {
+        require(msg.sender == owner);
+        require(block.timestamp >= auctionEndTime);
+        require(!ended);
+
         ended = true;
-        emit AuctionEnded(highestBidder, highestBid); // Emit auction ended event
+        emit AuctionEnded(highestBidder, highestBid);
     }
 
-    function claimFunds() external auctionEnded {
-        // Function for bidders (excluding winner) to reclaim funds
-        require(msg.sender != highestBidder); // Winner cannot claim back funds
+    /**
+     * @dev Refunds Ethers to all non-winning bidders.
+     */
+    function refundLosingBidders() external {
+        require(ended);
 
-        uint256 amount = 0;
-        for (uint256 i = 0; i < bids[msg.sender].length; i++) {
-            amount += bids[msg.sender][i].amount; // Sum up all bids by the sender
+        uint256 len = bidders.length;
+        address bidder;
+        uint256 amount;
+
+        for (uint256 i = 0; i < len; i++) {
+            bidder = bidders[i];
+            if (bidder != highestBidder) {
+                amount = pendingReturns[bidder];
+                if (amount > 0) {
+                    pendingReturns[bidder] = 0;
+                    payable(bidder).transfer(amount);
+                    emit Withdrawn(bidder, amount);
+                }
+            }
         }
-
-        require(amount > 0); // Ensure there's something to refund
-
-        uint256 refund = amount - (amount * 2) / 100; // Apply a 2% fee before refunding
-
-        payable(msg.sender).transfer(refund); // Transfer the refund
     }
 
-    function getWinner() external view auctionEnded returns (address, uint256) {
-        // View function to return the winner and highest bid
-        return (highestBidder, highestBid);
+    /**
+     * @dev Allows bidders withdraw part of their refundable balance.
+     * @param _amount Amount to withdraw.
+     */
+    function partialWithdraw(uint256 _amount) external {
+        require(_amount > 0);
+        uint256 available = pendingReturns[msg.sender];
+        require(available >= _amount);
+
+        pendingReturns[msg.sender] -= _amount;
+        payable(msg.sender).transfer(_amount);
+
+        emit Withdrawn(msg.sender, _amount);
     }
 
-    function getOffers(address user) external view returns (Bid[] memory) {
-        // View function to get all bids made by a specific user
-        return bids[user];
+    /**
+     * @dev Allows the owner to withdraw funds in case of emergency.
+     */
+    function emergencyWithdraw() external {
+        require(msg.sender == owner);
+        uint256 balance = address(this).balance;
+        require(balance > 0);
+        payable(owner).transfer(balance);
+        emit EmergencyWithdrawal(owner, balance);
+    }
+
+    /**
+     * @dev Returns the list of bidders.
+     * @return list of bidder addresses.
+     */
+    function getBidders() external view returns (address[] memory) {
+        return bidders;
     }
 }
